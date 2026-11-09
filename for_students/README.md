@@ -139,3 +139,81 @@ behavior, and final pass or fail result. The included data lets you test your
 approach locally. Your final submission may also be tested on different
 household days that you have not seen, so your strategy should generalize
 rather than memorize the provided test period.
+
+## Part III — Environment signals and rewards
+
+The market operates in half-hour periods grouped into simulated days. Each ISO
+makes one action for the whole upcoming day, while the PCS makes one battery
+action during each half-hour.
+
+### Main ISO and competitor ISO
+
+Both ISOs use the same observation, action, and reward structure when they are
+being trained.
+
+**Observation:** an ISO receives the predicted household consumption for every
+half-hour of the upcoming day. The environment also supports additional
+per-period features if they are included in the prediction data, although the
+provided setup currently uses only the consumption forecast. The ISO does not
+directly observe the other ISO's action or the day's realized consumption
+before choosing its action.
+
+**Action:** for every half-hour of the upcoming day, an ISO chooses:
+
+- the price it will pay for electricity exported by the PCS;
+- the retail price it will charge the PCS; and
+- the amount of generation it will dispatch in advance.
+
+The PCS buys from the ISO offering the lower retail price and sells exports to
+the ISO offering the higher payment. Exact price ties split the transaction
+between the two ISOs.
+
+**Reward:** an ISO receives its total profit for the simulated day:
+
+```text
+retail revenue
++ margin from reselling PCS exports
+- cost of all generation dispatched in advance
+- cost of emergency energy needed when won demand exceeds dispatch
+```
+
+Unused dispatch still costs money. Dispatching too little can require expensive
+emergency energy, while uncompetitive prices can cause the ISO to lose the
+transaction entirely.
+
+### PCS
+
+The PCS controls the household battery and acts once per half-hour.
+
+**Observation:** the PCS receives:
+
+- its current battery level and household consumption;
+- the current lowest retail price available from the two ISOs;
+- the current highest payment available for household exports;
+- future consumption predictions and a mask showing which predictions are
+  valid within the current day; and
+- the battery's remaining charge and discharge capacity.
+
+The PCS sees the best available market prices, not each ISO's offer separately.
+
+**Action:** one continuous battery instruction. Positive actions charge the
+battery, negative actions discharge it, and an action near zero leaves it
+mostly unchanged. Battery limits and household consumption determine the
+actual energy exchanged with the market.
+
+**Reward:** the PCS receives its transaction money for that half-hour, minus a
+penalty when household consumption still requires grid energy. Buying energy is
+a cost to the PCS, selling genuine excess energy earns money, and battery use
+can shift those transactions across the day.
+
+### Alternating training and evaluation
+
+Training rotates between the main ISO, the competitor, and the PCS. The main
+ISO learns against the competitor's current policy; the competitor then learns
+against the main ISO's current policy; and the PCS continues adapting to the
+prices produced by both. Their updates share the same overall CPU-time budget.
+
+For evaluation, the trained main ISO is frozen. Fresh copies of the original
+pretrained PCS and competitor are loaded, and the later chronological data is
+run once without any further learning. Only the main ISO's total profit
+determines pass or fail.
