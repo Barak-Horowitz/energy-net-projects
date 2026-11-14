@@ -52,83 +52,120 @@
 # create_model contract:
 # seed - use for ALL randomness (e.g. seed=seed on SB3 constructors)
 # custom learn() must call the callback - that's how the CPU budget stops training
-# changing the reward = wrapping the env inside our model's set_env - check with staff that this is allowed
+# changing the reward = custom replay buffer that transforms the reward when storing it (staff-approved on the forum),
+#   never modify the shared env itself (e.g. replacing training_environment.step) - that fails the assignment
 
-import gymnasium as gym
-import numpy as np
+import gymnasium as gym 
+import numpy as np 
 from stable_baselines3 import SAC
+from stable_baselines3.common.buffers import ReplayBuffer
 
-from energy_net.gym_envs.alternating_env import get_pred_window
 from for_students.internal.market_support import (
     EXTERNAL_RESALE_PRICE,
     MINIMUM_PCS_EXPORT_PRICE,
+    DEFAULT_EMERGENCY_COST,
+    DEFAULT_GENERATION_COST
 )
 
-PRICE_MAX = 0.20 # action 1.0 = 0.20/unit
-MIN_PRICE_STEP = 0.0001 # "minimum amount" we undercut/outbid the opponent by
+# custom replay buffer: the env still returns real profit, we only change
+# the reward our agent stores for its own training
+class MyRewardBuffer(ReplayBuffer):
+    EMERGENCY_USAGE_PENALTY_MODIFIER = DEFAULT_EMERGENCY_COST * 5
+    UNUSED_ENERGY_PENALTY_MODIFIER = DEFAULT_GENERATION_COST * 3
+    def add(self, obs, next_obs, action, reward, done, infos):
+        # SB3 passes arrays with one entry per env, infos is a list of info dicts
+        emergency = np.array([info['controlled_iso_emergency_energy'] for info in infos])
+        dispatch = np.array([info['controlled_iso_dispatch_energy'] for info in infos])
+        retail = np.array([info['controlled_iso_retail_energy'] for info in infos])
+        unused_generated_energy = dispatch - (retail - emergency)
+        training_reward = reward - (emergency * self.EMERGENCY_USAGE_PENALTY_MODIFIER) - (unused_generated_energy * self.UNUSED_ENERGY_PENALTY_MODIFIER) 
+        super().add(obs, next_obs, action, training_reward, done, infos)
+    
+# custom wrapper around the env to allow for us to override actions
+# by remapping them into "reasonable" intervals (as specified in decode)
+class BoundedActions(gym.Wrapper):
+    # remember the observation, decode needs the forecast
+    def reset(self, **kwargs):
+        self.last_obs, info = self.env.reset(**kwargs)
+        return self.last_obs, info
 
-
-# custom wrapper around the training env to override the reward function.
-# EXPERIMENT: reward = profit - (max_profit - profit), where max_profit is the hindsight best response:
-#   retail  - price MIN_PRICE_STEP below the opponent, dispatch exactly the PCS imports (no emergency energy)
-#   buyback - price MIN_PRICE_STEP above the opponent (at least 0.06 so the PCS exports)
-#   skip any half-hour where winning would lose money
-# assumes the PCS would have imported/exported the same amounts under our "best" prices (ignores battery reaction)
-# NOTE: reads env internals (opponent model, pcs_env.day_steps) - only affects training reward, not evaluation
-class MaxProfitRegretReward(gym.Wrapper):
     def step(self, action):
-        market = self.env
-        T = market.T
-
-        # the env asks the opponent for its action with this same observation and deterministic=True,
-        # so this reproduces exactly the offer the opponent makes this day
-        opponent_observation = get_pred_window(market, market._next_start_idx, T)
-        opponent_action, _ = market.opponent_iso_model.predict(opponent_observation, deterministic=True)
-        opponent_action = np.asarray(opponent_action, dtype=np.float32).reshape(-1)
-        opponent_buyback = opponent_action[:T] * PRICE_MAX
-        opponent_retail = opponent_action[T:2 * T] * PRICE_MAX
-
-        obs, profit, terminated, truncated, info = market.step(action)
-
-        # per-half-hour PCS grid flow for the day just simulated (positive = imports, negative = exports)
-        market_energy = np.array([step["market_energy_units"] for step in market.pcs_env.day_steps])
-        imports = np.maximum(market_energy, 0.0)
-        exports = np.maximum(-market_energy, 0.0)
-
-        best_retail = opponent_retail - MIN_PRICE_STEP
-        retail_profit = np.maximum(imports * (best_retail - market.generation_cost), 0.0)
-
-        best_buyback = np.maximum(opponent_buyback + MIN_PRICE_STEP, MINIMUM_PCS_EXPORT_PRICE)
-        export_profit = np.maximum(exports * (EXTERNAL_RESALE_PRICE - best_buyback), 0.0)
-
-        max_profit = float(np.sum(retail_profit) + np.sum(export_profit))
-        info["max_profit"] = max_profit
-
-        new_reward = profit - (max_profit - profit)
-        return obs, new_reward, terminated, truncated, info
+        env_action = decode(action, self.last_obs, self.env.generation_cost, self.env.dispatch_scale)
+        obs, reward, terminated, truncated, info = self.env.step(env_action)
+        self.last_obs = obs
+        return obs, reward, terminated, truncated, info
 
 
-# SAC that wraps every env the trainer hands it (the trainer calls set_env before every training phase)
-class RegretSAC(SAC):
+# SAC that trains on the bounded env and returns bounded actions to everyone else
+class BoundedSAC(SAC):
+    # trainer passes the RAW env before every phase -> wrap it every time
     def set_env(self, env, force_reset=True):
-        super().set_env(MaxProfitRegretReward(env), force_reset=force_reset)
+        return super().set_env(BoundedActions(env), force_reset=force_reset)
 
+    # flag so predict() knows it's being called from inside training
+    def learn(self, *args, **kwargs):
+        self._in_learn = True
+        try:
+            return super().learn(*args, **kwargs)
+        finally:
+            self._in_learn = False
+            
+    # bound predictions before outputting
+    def predict(self, observation, state=None, episode_start=None, deterministic=False):
+        action, state = super().predict(observation, state, episode_start, deterministic)
+        if getattr(self, "_in_learn", False):
+            return action, state
+        return decode(action, observation, self.generation_cost, self.max_dispatch), state 
+    
 
+# agent outputs values for sale price, purchase price, energy generation 
+# in [0, 1] space. A ton of values in this space make no sense at all
+#(i.e. setting sale price lower then generation cost)
+# so we bound the agent's outputs to the following ranges
+# (each block is remapped as low + a * (high - low), so every agent value lands somewhere in the range)
+# buyback: within [0.06, 0.12] - we sell for 0.12 buying for more makes no sense,
+# retail: within [generation_cost, 0.20] - selling for less then generation cost makes no sense
+# dispatch: within [forecasted, max_dispatch] - making less energy then forecasted for usage is obviously wrong choice as it leads to emergency costs
+# bounds are computed in $ / energy units, then converted back to the env's raw [0, 1] scale
+PRICE_MAX = 0.20 # price action 1.0 = 0.20/unit
+
+def decode(action, observation, generation_cost, max_dispatch):
+    action = np.clip(np.asarray(action, dtype=np.float32).reshape(-1), 0.0, 1.0)
+    T = len(action) // 3
+    forecast = np.asarray(observation, dtype=np.float32).reshape(-1)[:T]
+
+    # rescale buyback into [0.06, 0.12]
+    buyback = MINIMUM_PCS_EXPORT_PRICE + action[:T] * (EXTERNAL_RESALE_PRICE - MINIMUM_PCS_EXPORT_PRICE)
+    # rescale retail into [generation_cost, 0.20]
+    retail = generation_cost + action[T:2 * T] * (PRICE_MAX - generation_cost)
+    # rescale dispatch into [forecast, max_dispatch] (clipped if the forecast is ever above the env's cap)
+    low = np.minimum(forecast, max_dispatch)
+    dispatch = low + action[2 * T:] * (max_dispatch - low)
+    return np.concatenate([
+        buyback / PRICE_MAX,
+        retail / PRICE_MAX,
+        dispatch / max_dispatch,
+    ]).astype(np.float32)
+    
 def create_model(training_environment, seed):
     """Return a new model implementing set_env(), learn(), and predict()."""
     # SAC = soft actor critic library, standard RL library (TODO: watch tutorials to figure out how it works)
-    return RegretSAC(
+    model = BoundedSAC(
         "MlpPolicy", # network to use (options are mlpPolicy, CnnPolicy, MultiInputPolicy)
-        MaxProfitRegretReward(training_environment), # environment SAC trains off of
+        BoundedActions(training_environment), # environment SAC trains off of
+        replay_buffer_class=MyRewardBuffer, # stores our shaped reward instead of raw profit
         seed=seed, # random seed passed in to use for random events
         verbose=0, # log level 
-        learning_rate=0.0003, # size of weight changes applied to newtwork 
+        learning_rate=0.003, # size of weight changes applied to newtwork 
         buffer_size=100_000, # how many previous timesteps are held 
         learning_starts=32, # number of steps taken to establish baseline before training
         batch_size=64, # number of steps taken into account for each weight update
         train_freq=(1, "step"), # how often to train, what to call
         gradient_steps=1, # how many weight updates/step
-        gamma=0.99, #discount factor (how much an immediate reward is worth compared to long term)
+        gamma=1, #discount factor (how much an immediate reward is worth compared to long term)
         tau=0.005, # how slowly target critics follow main critics? TODO: figure out what this means
         ent_coef="auto", # weight of exploration vs. exploitation
     )
+    model.generation_cost = training_environment.generation_cost
+    model.max_dispatch = training_environment.dispatch_scale
+    return model
