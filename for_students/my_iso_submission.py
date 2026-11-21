@@ -71,14 +71,14 @@ from for_students.internal.market_support import (
 # the reward our agent stores for its own training
 class MyRewardBuffer(ReplayBuffer):
     EMERGENCY_USAGE_PENALTY_MODIFIER = DEFAULT_EMERGENCY_COST * 5
-    UNUSED_ENERGY_PENALTY_MODIFIER = DEFAULT_GENERATION_COST * 3
+    #UNUSED_ENERGY_PENALTY_MODIFIER = DEFAULT_GENERATION_COST * 3
     def add(self, obs, next_obs, action, reward, done, infos):
         # SB3 passes arrays with one entry per env, infos is a list of info dicts
         emergency = np.array([info['controlled_iso_emergency_energy'] for info in infos])
         dispatch = np.array([info['controlled_iso_dispatch_energy'] for info in infos])
         retail = np.array([info['controlled_iso_retail_energy'] for info in infos])
         unused_generated_energy = dispatch - (retail - emergency)
-        training_reward = reward - (emergency * self.EMERGENCY_USAGE_PENALTY_MODIFIER) - (unused_generated_energy * self.UNUSED_ENERGY_PENALTY_MODIFIER) 
+        training_reward = reward - (emergency * self.EMERGENCY_USAGE_PENALTY_MODIFIER) #- (unused_generated_energy * self.UNUSED_ENERGY_PENALTY_MODIFIER) 
         super().add(obs, next_obs, action, training_reward, done, infos)
     
 # custom wrapper around the env to allow for us to override actions
